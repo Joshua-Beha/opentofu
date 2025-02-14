@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/hcl"
 	hclast "github.com/hashicorp/hcl/hcl/ast"
 
+	"github.com/opentofu/opentofu/internal/command/cliconfig/ociauthconfig"
 	"github.com/opentofu/opentofu/internal/tfdiags"
 )
 
@@ -239,9 +240,215 @@ type OCIRepositoryCredentials struct {
 	// authentication method. These are mutually-exclusive with Username
 	// and Password.
 	AccessToken, RefreshToken string
+
+	// DockerCredentialsHelper is the name of a Docker-style credential helper program
+	// to use.
+	//
+	// Docker-style config only allows credential helpers to be configured at
+	// whole-registry-domain granularity, so for consistency we only allow this to be
+	// set when RepositoryPathPrefix isn't set.
+	DockerCredentialHelper string
 }
 
-// TODO: Implement decodeOCICredentialsFromConfig, returning []*OCIRepositoryCredentials
+// decodeOCICredentialsFromConfig uses the HCL AST API directly to decode
+// "oci_credentials" blocks from the given file.
+//
+// The overall CLI configuration can contain zero or more blocks of this
+// type. We require that each one describes a distinct OCI repository
+// address prefix, but that constraint must be enforced by the caller of
+// this function because it must be checked across all of the CLI
+// configuration files together, rather than just one file at a time.
+//
+// This uses the HCL AST directly, rather than HCL's decoder, to continue
+// our precedent of trying to constrain new features only to what could be
+// supported compatibly in a hypothetical future HCL 2-based implementation
+// of the CLI configuration language.
+//
+// Note that this function wants the top-level file object which might or
+// might not contain oci_credentials blocks, not an oci_credentials block
+// directly itself.
+func decodeOCICredentialsFromConfig(hclFile *hclast.File) ([]*OCIRepositoryCredentials, tfdiags.Diagnostics) {
+	var ret []*OCIRepositoryCredentials
+	var diags tfdiags.Diagnostics
+
+	root, ok := hclFile.Node.(*hclast.ObjectList)
+	if !ok {
+		// A HCL file that doesn't have an object list at its root is weird, but
+		// dealing with that is outside the scope of this function.
+		// (In practice both the native syntax and JSON parsers for HCL force
+		// the root to be an ObjectList, so we should not get here for any real file.)
+		return ret, diags
+	}
+	for _, block := range root.Items {
+		if block.Keys[0].Token.Value() != "oci_credentials" {
+			continue
+		}
+
+		// HCL only tracks whether the input was JSON or native syntax inside
+		// individual tokens, so we'll use our block type token to decide
+		// and assume that the rest of the block must be written in the same
+		// syntax, because syntax is a whole-file idea.
+		const errInvalidSummary = "Invalid oci_credentials block"
+		isJSON := block.Keys[0].Token.JSON
+		if block.Assign.Line != 0 && !isJSON {
+			// Seems to be an attribute rather than a block
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				errInvalidSummary,
+				fmt.Sprintf("The oci_credentials block at %s must not be introduced with an equals sign.", block.Pos()),
+			))
+			continue
+		}
+		if len(block.Keys) != 2 && !isJSON {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				errInvalidSummary,
+				fmt.Sprintf("The oci_credentials block at %s must have one label, giving an OCI repository address prefix.", block.Pos()),
+			))
+			continue
+		}
+		body, ok := block.Val.(*hclast.ObjectType)
+		if !ok {
+			// We can't get in here with native HCL syntax because we
+			// already checked above that we're using block syntax, but
+			// if we're reading JSON then our value could potentially be
+			// anything.
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				errInvalidSummary,
+				fmt.Sprintf("The oci_credentials block at %s must be represented by a JSON object.", block.Pos()),
+			))
+			continue
+		}
+
+		result, blockDiags := decodeOCICredentialsBlockBody(block.Keys[1].Token.Text, body)
+		diags = diags.Append(blockDiags)
+		if result != nil {
+			ret = append(ret, result)
+		}
+	}
+
+	return ret, diags
+}
+
+func decodeOCICredentialsBlockBody(label string, body *hclast.ObjectType) (*OCIRepositoryCredentials, tfdiags.Diagnostics) {
+	const errInvalidSummary = "Invalid oci_credentials block"
+	var diags tfdiags.Diagnostics
+
+	registryDomain, repositoryPath, labelErr := ociauthconfig.ParseRepositoryAddressPrefix(label)
+	if labelErr != nil {
+		diags = append(diags, tfdiags.Sourceless(
+			tfdiags.Error,
+			errInvalidSummary,
+			fmt.Sprintf(
+				"The oci_credentials block at %s has an invalid block label: %s.",
+				body.Pos(), labelErr,
+			),
+		))
+		return nil, diags
+	}
+
+	// Although decodeOCICredentialsFromConfig did some lower-level decoding
+	// to try to force HCL 2-compatible syntax, the _content_ of this block is all
+	// just relatively-simple arguments and so we can use HCL 1's decoder here.
+	type BodyContent struct {
+		// The following three groups of arguments are mutually-exclusive.
+
+		// Basic-auth-style credentials, statically configured
+		Username *string `hcl:"username"`
+		Password *string `hcl:"password"`
+
+		// OAuth style credentials
+		AccessToken  *string `hcl:"access_token"`
+		RefreshToken *string `hcl:"refresh_token"`
+
+		// Docuer-style credentials helper providing Basic-auth-style credentials
+		// indirectly through an external program
+		DockerCredentialsHelper *string `hcl:"docker_credentials_helper"`
+	}
+	var bodyContent BodyContent
+	err := hcl.DecodeObject(&bodyContent, body)
+	if err != nil {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			errInvalidSummary,
+			fmt.Sprintf("Invalid oci_credentials block at %s: %s.", body.Pos(), err),
+		))
+		return nil, diags
+	}
+
+	staticBasicAuth := bodyContent.Username != nil || bodyContent.Password != nil
+	oauth := bodyContent.AccessToken != nil || bodyContent.RefreshToken != nil
+	dockerCredHelper := bodyContent.DockerCredentialsHelper != nil
+	stylesConfigured := trueCount(staticBasicAuth, oauth, dockerCredHelper)
+	if stylesConfigured == 0 {
+		diags = append(diags, tfdiags.Sourceless(
+			tfdiags.Error,
+			errInvalidSummary,
+			fmt.Sprintf(
+				"The oci_credentials block at %s must set either username+password, access_token+refresh_token, or docker_credentials_helper.",
+				body.Pos(),
+			),
+		))
+		return nil, diags
+	}
+	if stylesConfigured > 1 {
+		diags = append(diags, tfdiags.Sourceless(
+			tfdiags.Error,
+			errInvalidSummary,
+			fmt.Sprintf(
+				"The oci_credentials block at %s must set only one group out of username+password, access_token+refresh_token, or docker_credentials_helper.",
+				body.Pos(),
+			),
+		))
+		return nil, diags
+	}
+
+	ret := &OCIRepositoryCredentials{
+		RegistryDomain:       registryDomain,
+		RepositoryPathPrefix: repositoryPath,
+	}
+	switch {
+	case staticBasicAuth:
+		if bodyContent.Username == nil || bodyContent.Password == nil {
+			diags = append(diags, tfdiags.Sourceless(
+				tfdiags.Error,
+				errInvalidSummary,
+				fmt.Sprintf(
+					"The oci_credentials block at %s must set both username and password together when using static credentials.",
+					body.Pos(),
+				),
+			))
+			return nil, diags
+		}
+		ret.Username = *bodyContent.Username
+		ret.Password = *bodyContent.Password
+	case oauth:
+		// FIXME: Is refresh_roken actually required? We could potentially allow setting
+		// only access_token and let the request just immediately fail if the token has expired.
+		if bodyContent.AccessToken == nil || bodyContent.RefreshToken == nil {
+			diags = append(diags, tfdiags.Sourceless(
+				tfdiags.Error,
+				errInvalidSummary,
+				fmt.Sprintf(
+					"The oci_credentials block at %s must set both access_token and refresh_token together when using OAuth-style credentials.",
+					body.Pos(),
+				),
+			))
+			return nil, diags
+		}
+		ret.AccessToken = *bodyContent.AccessToken
+		ret.RefreshToken = *bodyContent.RefreshToken
+	case dockerCredHelper:
+		ret.DockerCredentialHelper = *bodyContent.DockerCredentialsHelper
+	}
+
+	// TODO: Further validation rules, like:
+	// - is the docker credentials helper specified using valid syntax?
+	// - if docker credentials helper is specified, is the repositoryPath empty? (Docker credential helpers are only for entire registry domains)
+
+	return ret, diags
+}
 
 func validDockerCredentialHelperName(n string) bool {
 	switch {
@@ -259,4 +466,14 @@ func validDockerCredentialHelperName(n string) bool {
 	default:
 		return true
 	}
+}
+
+func trueCount(flags ...bool) int {
+	ret := 0
+	for _, flag := range flags {
+		if flag {
+			ret++
+		}
+	}
+	return ret
 }

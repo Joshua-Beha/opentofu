@@ -66,11 +66,15 @@ type Config struct {
 	// that validation at validation time rather than initial decode time.
 	ProviderInstallation []*ProviderInstallation
 
-	// OCIDefaultCredentials represents any oci_default_credentials blocks
-	// in the configuration. Only one of these is allowed across the whole
-	// configuration, but we decode into a slice here so that we can handle
-	// that validation at validation time rather than initial decode time.
-	OCIDefaultCredentials []*OCIDefaultCredentials
+	// OCIDefaultCredentials and OCIRepositoryCredentials together represent
+	// the individual OCI-credentials-related blocks in the configuration.
+	//
+	// Only one OCIDefaultCredentials element is allowed, but we validate
+	// that after loading the configuration. Zero or more OCICredentials
+	// blocks are allowed, but they must each have a unique repository
+	// prefix.
+	OCIDefaultCredentials    []*OCIDefaultCredentials
+	OCIRepositoryCredentials []*OCIRepositoryCredentials
 }
 
 // ConfigHost is the structure of the "host" nested block within the CLI
@@ -193,6 +197,9 @@ func loadConfigFile(path string) (*Config, tfdiags.Diagnostics) {
 	ociDefaultCredsBlocks, ociDefaultCredsDiags := decodeOCIDefaultCredentialsFromConfig(obj)
 	diags = diags.Append(ociDefaultCredsDiags)
 	result.OCIDefaultCredentials = ociDefaultCredsBlocks
+	ociCredsBlocks, ociCredsDiags := decodeOCICredentialsFromConfig(obj)
+	diags = diags.Append(ociCredsDiags)
+	result.OCIRepositoryCredentials = ociCredsBlocks
 
 	// Replace all env vars
 	for k, v := range result.Providers {
